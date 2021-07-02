@@ -1,3 +1,4 @@
-Exporter for Sensu Server
+Exporter for Sensu-Go Server
+Fork from github.com/qvicksilver/sensu_exporter which has sensu-go version of github.com/reachlin/sensu_exporter
 Copyright 2017 reachlin@gmail.com
 

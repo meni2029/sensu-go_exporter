@@ -2,20 +2,26 @@ package main
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io/ioutil"
 	"net/http"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/prometheus/common/log"
 )
 
 var (
-	timeout       = flag.Duration("timeout", 3000, "Timeout in nanoseconds for the API request")
+	timeout       = flag.Duration("timeout", 2*time.Second, "Timeout for the API request")
 	listenAddress = flag.String(
 		// exporter port list:
 		// https://github.com/prometheus/prometheus/wiki/Default-port-allocations
@@ -26,24 +32,39 @@ var (
 		"api", "http://localhost:8080",
 		"URL to Sensu API.",
 	)
+	insecure = flag.Bool(
+		"insecure", false,
+		`Client do not verify the server's certificate chain and host name. 
+		If used, crypto/tls accepts any certificate presented by the server and any host name in that certificate. 
+		In this mode, TLS is susceptible to machine-in-the-middle attacks unless custom verification is used. 
+		This should be used only for testing or in combination with VerifyConnection or VerifyPeerCertificate.`,
+	)
 	username = flag.String(
 		"username", "admin", "Username for authentication")
+	authfile = flag.String("authfile", "", "Read password from file. It not set, password is taken from environment variable SENSU_PASSWORD")
+	logLevel = flag.String("loglevel", "Info", "Log level: Debug, Info, Warn, Error, Fatal")
 )
 
+type SensuNamespaces struct {
+	Name string
+}
+
 type SensuEvent struct {
-	Entity SensuEntity
-	Check  SensuCheck
+	Entity   SensuEntity
+	Check    SensuCheck
+	Metadata SensuMetadata
 }
 
 type SensuCheck struct {
-	Duration float64
-	Executed int64
-	//Output      string
-	Status   int
-	Issued   int64
-	Interval int
-	Metadata SensuMetadata
-	State    string
+	Duration          float64
+	Executed          int64
+	Status            int
+	Issued            int64
+	Interval          int
+	Metadata          SensuMetadata
+	State             string
+	Is_silenced       bool
+	Proxy_entity_name string
 }
 
 type Token struct {
@@ -53,7 +74,8 @@ type Token struct {
 }
 
 type SensuMetadata struct {
-	Name string
+	Name      string
+	Namespace string
 }
 
 type SensuEntity struct {
@@ -77,9 +99,14 @@ func (c *SensuCollector) Collect(ch chan<- prometheus.Metric) {
 	c.mutex.Lock() // To protect metrics from concurrent collects.
 	defer c.mutex.Unlock()
 
-	results := c.getEvents()
+	var results []SensuEvent
+	namespaces := c.getNamespaces()
+	for _, namespace := range namespaces {
+		results = append(results, c.getEvents(namespace.Name)...)
+	}
+
 	for i, result := range results {
-		log.Debugln("...", fmt.Sprintf("%d, %v, %v", i, result.Check.Metadata.Name, result.Check.Status))
+		log.Debugln("...", fmt.Sprintf("%d, %v, %v, %v, %v, %v, %v, %v", i, result.Entity.Metadata.Namespace, result.Entity.Metadata.Name, result.Check.Metadata.Name, result.Check.Is_silenced, result.Check.State, result.Check.Status, result.Check.Proxy_entity_name))
 		// in Sensu, 0 means OK
 		// in Prometheus, 1 means OK
 		status := 0.0
@@ -92,20 +119,35 @@ func (c *SensuCollector) Collect(ch chan<- prometheus.Metric) {
 			c.CheckStatus,
 			prometheus.GaugeValue,
 			status,
+			result.Entity.Metadata.Namespace,
 			result.Entity.Metadata.Name,
 			result.Check.Metadata.Name,
+			strconv.FormatBool(result.Check.Is_silenced),
+			result.Check.State,
+			strconv.Itoa(result.Check.Status),
+			result.Check.Proxy_entity_name,
 		)
 	}
 }
 
-func (c *SensuCollector) getEvents() []SensuEvent {
+func (c *SensuCollector) getEvents(namespace string) []SensuEvent {
 	log.Debugln("Sensu API URL", c.apiUrl)
 	events := []SensuEvent{}
-	err := c.getJson(c.apiUrl+"/api/core/v2/namespaces/default/events", &events)
+	err := c.getJson(c.apiUrl+"/api/core/v2/namespaces/"+namespace+"/events", &events)
 	if err != nil {
 		log.Errorln("Query Sensu failed.", fmt.Sprintf("%v", err))
 	}
 	return events
+}
+
+func (c *SensuCollector) getNamespaces() []SensuNamespaces {
+	log.Debugln("Sensu API URL", c.apiUrl)
+	namespaces := []SensuNamespaces{}
+	err := c.getJson(c.apiUrl+"/api/core/v2/namespaces", &namespaces)
+	if err != nil {
+		log.Errorln("Query Sensu failed.", fmt.Sprintf("%v", err))
+	}
+	return namespaces
 }
 
 func (c *SensuCollector) getJson(url string, obj interface{}) error {
@@ -140,6 +182,7 @@ func (c *SensuCollector) authenticate(username string, password string) error {
 	defer resp.Body.Close()
 	err = json.NewDecoder(resp.Body).Decode(&c.token)
 	if err != nil {
+		log.Error("Token creation error")
 		return err
 	}
 
@@ -169,35 +212,56 @@ func (c *SensuCollector) refreshToken() error {
 
 // END: Class SensuCollector
 
-func NewSensuCollector(apiUrl string, username string, password string, cli *http.Client) *SensuCollector {
+func NewSensuCollector(apiUrl string, username string, password string, cli *http.Client) (*SensuCollector, error) {
 	sc := &SensuCollector{
 		cli:    cli,
 		apiUrl: apiUrl,
 		CheckStatus: prometheus.NewDesc(
 			"sensu_check_status",
 			"Sensu Check Status(1:Up, 0:Down)",
-			[]string{"client", "check_name"},
+			[]string{"sensu_namespace", "entity_name", "check_name", "check_is_silenced", "check_state", "check_status", "check_proxy_entity_name"},
 			nil,
 		),
 	}
 	err := sc.authenticate(username, password)
-	if err != nil {
-		log.Infoln(err)
-	}
-	return sc
+
+	return sc, err
 }
 
 func main() {
 	flag.Parse()
+	log.Base().SetLevel(*logLevel)
 
-	password := os.Getenv("SENSU_PASSWORD")
-	collector := NewSensuCollector(*apiUrl, *username, password, &http.Client{
-		Timeout: *timeout,
+	// manage password
+	var password string
+	if len(*authfile) > 0 {
+		log.Debug("Read pasword from file:", *authfile)
+		content, err := ioutil.ReadFile(*authfile)
+		if err != nil {
+			log.Fatal("Password could not be read from file:", err)
+		}
+		password = strings.TrimSuffix(string(content), "\n")
+	} else {
+		log.Debug("Read pasword from env var SENSU_PASSWORD")
+		password = os.Getenv("SENSU_PASSWORD")
+	}
+	if len(password) == 0 {
+		log.Fatal("Password empty")
+	}
+
+	customTransport := http.DefaultTransport.(*http.Transport).Clone()
+	customTransport.TLSClientConfig = &tls.Config{InsecureSkipVerify: *insecure}
+	collector, err := NewSensuCollector(*apiUrl, *username, password, &http.Client{
+		Timeout:   *timeout,
+		Transport: customTransport,
 	})
-	fmt.Println(collector.cli.Timeout)
+	if err != nil {
+		log.Fatal("API connection error:", err)
+	}
+	log.Infoln("API timeout:", collector.cli.Timeout)
 	prometheus.MustRegister(collector)
 	metricPath := "/metrics"
-	http.Handle(metricPath, prometheus.Handler())
+	http.Handle(metricPath, promhttp.Handler())
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(metricPath))
 	})
