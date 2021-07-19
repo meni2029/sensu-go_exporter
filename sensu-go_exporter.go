@@ -56,15 +56,18 @@ type SensuEvent struct {
 }
 
 type SensuCheck struct {
-	Duration          float64
-	Executed          int64
-	Status            int
-	Issued            int64
-	Interval          int
-	Metadata          SensuMetadata
-	State             string
-	Is_silenced       bool
-	Proxy_entity_name string
+	Duration              float64
+	Executed              int64
+	Status                int
+	Issued                int64
+	Interval              int
+	Metadata              SensuMetadata
+	State                 string
+	Last_ok               int64
+	Occurrences           int
+	Occurrences_watermark int
+	Is_silenced           bool
+	Proxy_entity_name     string
 }
 
 type Token struct {
@@ -106,7 +109,7 @@ func (c *SensuCollector) Collect(ch chan<- prometheus.Metric) {
 	}
 
 	for i, result := range results {
-		log.Debugln("...", fmt.Sprintf("%d, %v, %v, %v, %v, %v, %v, %v", i, result.Entity.Metadata.Namespace, result.Entity.Metadata.Name, result.Check.Metadata.Name, result.Check.Is_silenced, result.Check.State, result.Check.Status, result.Check.Proxy_entity_name))
+		log.Debugln("...", fmt.Sprintf("%d, %v, %v, %v, %v, %v, %v, %v, %v, %v, %v, %v", i, result.Entity.Metadata.Namespace, result.Entity.Metadata.Name, result.Check.Metadata.Name, result.Check.Issued, result.Check.Last_ok, result.Check.Occurrences, result.Check.Occurrences_watermark, result.Check.Is_silenced, result.Check.State, result.Check.Status, result.Check.Proxy_entity_name))
 		// in Sensu, 0 means OK
 		// in Prometheus, 1 means OK
 		status := 0.0
@@ -115,6 +118,14 @@ func (c *SensuCollector) Collect(ch chan<- prometheus.Metric) {
 		} else {
 			status = 0.0
 		}
+		last_ok_sec := ""
+		if result.Check.Last_ok != 0 {
+			last_ok_sec = strconv.FormatInt(result.Check.Issued-result.Check.Last_ok, 10)
+		}
+		if result.Check.Status == 0 {
+			last_ok_sec = "0"
+		}
+
 		ch <- prometheus.MustNewConstMetric(
 			c.CheckStatus,
 			prometheus.GaugeValue,
@@ -122,6 +133,9 @@ func (c *SensuCollector) Collect(ch chan<- prometheus.Metric) {
 			result.Entity.Metadata.Namespace,
 			result.Entity.Metadata.Name,
 			result.Check.Metadata.Name,
+			last_ok_sec,
+			strconv.Itoa(result.Check.Occurrences),
+			strconv.Itoa(result.Check.Occurrences_watermark),
 			strconv.FormatBool(result.Check.Is_silenced),
 			result.Check.State,
 			strconv.Itoa(result.Check.Status),
@@ -219,7 +233,7 @@ func NewSensuCollector(apiUrl string, username string, password string, cli *htt
 		CheckStatus: prometheus.NewDesc(
 			"sensu_check_status",
 			"Sensu Check Status(1:Up, 0:Down)",
-			[]string{"sensu_namespace", "entity_name", "check_name", "check_is_silenced", "check_state", "check_status", "check_proxy_entity_name"},
+			[]string{"sensu_namespace", "entity_name", "check_name", "last_ok_sec", "occurrences", "occurrences_watermark", "check_is_silenced", "check_state", "check_status", "check_proxy_entity_name"},
 			nil,
 		),
 	}

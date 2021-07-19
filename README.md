@@ -40,7 +40,7 @@ Usage of ./sensu-go_exporter:
 ## Exported Metrics
 | Metric | Meaning | Labels |
 | ------ | ------- | ------ |
-| sensu_check_status | Check results in a metric vector, status 1 means OK | sensu_namespace, entity_name, check_name, check_is_silenced, check_state, check_status, check_proxy_entity_name |
+| sensu_check_status | Check results in a metric vector, status 1 means OK | sensu_namespace, entity_name, check_name, last_ok_sec, occurrences, occurrences_watermark, check_is_silenced, check_state, check_status, check_proxy_entity_name |
 
 
 ### Docker [![Docker Pulls](https://img.shields.io/docker/pulls/meni2029/sensu-go_exporter.svg?maxAge=604800)][hub]
@@ -48,7 +48,7 @@ Usage of ./sensu-go_exporter:
 To run the sensu exporter as a Docker container, run:
 
 ```bash
-docker run -e SENSU_PASSWORD=$(cat /file/with/password) -p 9251:9251 meni2029/sensu-go_exporter:v1.0.0 --api="http://sensu_host:4567"
+docker run -e SENSU_PASSWORD=$(cat /file/with/password) -p 9251:9251 meni2029/sensu-go_exporter:v1.1.0 --api="http://sensu_host:4567"
 ```
 
 [hub]: https://hub.docker.com/r/meni2029/sensu-go_exporter/
